@@ -739,6 +739,14 @@ static int myeid_set_security_env_rsa(sc_card_t *card, const sc_security_env_t *
 		apdu.p1 = 0x81;
 		apdu.p2 = 0xB8;
 		break;
+	case SC_SEC_OPERATION_ENCRYPT_SYM:
+		apdu.p1 = 0x81;
+		apdu.p2 = 0xB8;
+		break;
+	case SC_SEC_OPERATION_DECRYPT_SYM:
+		apdu.p1 = 0x41;
+		apdu.p2 = 0xB8;
+		break;
 	default:
 		return SC_ERROR_INVALID_ARGUMENTS;
 	}
@@ -757,8 +765,17 @@ static int myeid_set_security_env_rsa(sc_card_t *card, const sc_security_env_t *
 		memcpy(p, env->file_ref.value, 2);
 		p += 2;
 	}
+	// symmetric operations: we need set the key reference
+	if (env->operation == SC_SEC_OPERATION_ENCRYPT_SYM || env->operation == SC_SEC_OPERATION_DECRYPT_SYM)
+	{
+		*p++ = 0x83;
+		*p++ = 1;
+		*p++ = 0;
+	}
 	if (env->flags & SC_SEC_ENV_KEY_REF_PRESENT && env->operation != SC_SEC_OPERATION_UNWRAP &&
-		env->operation != SC_SEC_OPERATION_WRAP)
+		env->operation != SC_SEC_OPERATION_WRAP &&
+		env->operation != SC_SEC_OPERATION_ENCRYPT_SYM &&
+		env->operation != SC_SEC_OPERATION_DECRYPT_SYM)
 	{
 		*p++ = 0x84;
 		*p++ = 1;
@@ -778,11 +795,15 @@ static int myeid_set_security_env_rsa(sc_card_t *card, const sc_security_env_t *
 			break;
 	    }
 
-	if (env->operation ==  SC_SEC_OPERATION_UNWRAP || env->operation == SC_SEC_OPERATION_WRAP)
+	r = 0;
+	if (env->operation ==  SC_SEC_OPERATION_UNWRAP || env->operation == SC_SEC_OPERATION_WRAP ||
+		env->operation == SC_SEC_OPERATION_ENCRYPT_SYM ||
+		env->operation == SC_SEC_OPERATION_DECRYPT_SYM)
 	{
 	    /* add IV if present */
 		for (i = 0; i < SC_SEC_ENV_MAX_PARAMS; i++)
 			if (env->params[i].param_type == SC_SEC_ENV_PARAM_IV) {
+				r = 1;
 				*p++ = 0x87;
 				*p++ = (unsigned char) env->params[i].value_len;
 				if (p + env->params[i].value_len >= sbuf + SC_MAX_APDU_BUFFER_SIZE) {
@@ -794,6 +815,16 @@ static int myeid_set_security_env_rsa(sc_card_t *card, const sc_security_env_t *
 				break;
 			}
 	}
+	/* for AES_ECB we need to reset the IV but we respect if the IV is already present */
+	if ((env->operation == SC_SEC_OPERATION_ENCRYPT_SYM || env->operation == SC_SEC_OPERATION_DECRYPT_SYM) &&
+		env->algorithm == SC_ALGORITHM_AES && env->algorithm_flags == SC_ALGORITHM_AES_ECB && r==0)
+	{
+		*p++ = 0x87;
+		*p++ = 16;
+		memset (p, 0, 16);
+		p += 16;
+	}
+
 	r = p - sbuf;
 	apdu.lc = r;
 	apdu.datalen = r;
@@ -962,9 +993,16 @@ static int myeid_set_security_env(struct sc_card *card,
 			{
 				tmp.algorithm_ref = 0x00;
 			}
-
 			if ((tmp.algorithm_flags & SC_ALGORITHM_AES_CBC_PAD) == SC_ALGORITHM_AES_CBC_PAD)
 				tmp.algorithm_ref |= 0x80;		/* set PKCS#7 padding */
+
+			/* Tag 0x80 algorithm_ref - value 0x80 or 0x8A is allowed only from version >= 4.2?
+			 * AES is supported from version 4.0 but without pkcs#7 padding.
+			 * For SC_SEC_OPERATION_ENCRYPT_SYM and SC_SEC_OPERATION_DECRYPT_SYM we running
+			 * PKCS#7 in software, here we fix the algorithm_ref variable.
+			 */
+			if (tmp.operation == SC_SEC_OPERATION_ENCRYPT_SYM || tmp.operation == SC_SEC_OPERATION_DECRYPT_SYM)
+				tmp.algorithm_ref = 0;
 
 			/* from this point, there's no difference to RSA SE */
 			return myeid_set_security_env_rsa(card, &tmp, se_num);
@@ -1799,6 +1837,176 @@ static int myeid_finish(sc_card_t * card)
 	return SC_SUCCESS;
 }
 
+static int myeid_enc_dec_sym(struct sc_card *card, const u8 * data, size_t datalen,
+                        u8 * out, size_t outlen, unsigned int algorithm, unsigned int algorithm_flags, int dir)
+{
+	struct sc_context *ctx;
+        struct sc_apdu apdu;
+        u8 rbuf[SC_MAX_APDU_BUFFER_SIZE];
+        u8 sbuf[SC_MAX_APDU_BUFFER_SIZE];
+        int r, padding = 0, cbc = 0;
+
+        size_t block_size = 16;
+        size_t return_len = 0;
+        size_t max_apdu_datalen;
+        size_t apdu_datalen;
+        size_t padded_data_len;
+
+        assert(card != NULL && data != NULL && out != NULL);
+
+        /* How many cipher blocks will fit in the APDU. We do not use the APDU chaining
+         * mechanism from OpenSC, because we need the size of the APDU data block
+         * to match a multiple of the cipher block size */
+
+        max_apdu_datalen = sc_get_max_send_size(card);
+        if (max_apdu_datalen > sc_get_max_recv_size(card))
+		max_apdu_datalen = sc_get_max_recv_size(card);
+
+        if (max_apdu_datalen > SC_MAX_APDU_BUFFER_SIZE)
+		max_apdu_datalen = SC_MAX_APDU_BUFFER_SIZE;
+
+        ctx = card->ctx;
+        LOG_FUNC_CALLED(ctx);
+
+        sc_log(ctx, "algorithm %d algorithm_flags %x running %s", algorithm, algorithm_flags, dir ? "encipher":"decipher");
+        padded_data_len = datalen;
+        switch (algorithm) {
+		case SC_ALGORITHM_AES:
+			block_size = 16;
+			if (algorithm_flags & SC_ALGORITHM_AES_ECB) {
+				padding = 0;
+				cbc = 0;
+			}
+			else if (algorithm_flags & SC_ALGORITHM_AES_CBC) {
+				padding = 0;
+				cbc = 1;
+			}
+			else if (algorithm_flags & SC_ALGORITHM_AES_CBC_PAD) {
+				if (dir == 1) {
+					/* round the datalen to multiple of block size */
+					padded_data_len = 1 + datalen / block_size;
+					padded_data_len = padded_data_len * block_size;
+				}
+				padding = 1;
+				cbc = 1;
+			}
+			else
+				LOG_FUNC_RETURN(ctx, SC_ERROR_NOT_SUPPORTED);
+
+			break;
+		case SC_ALGORITHM_DES:
+			block_size = 8;
+			/* src/libopensc/pkcs15-algo.c:#ifdef SC_ALGORITHM_DES   / CBC mode */
+			padding = 0;
+			cbc = 1;
+			break;
+		case SC_ALGORITHM_3DES:
+			block_size = 8;
+			/* src/libopensc/pkcs15-algo.c:#ifdef SC_ALGORITHM_3DES / EDE CBC mode */
+			padding = 0;
+			cbc = 1;
+			break;
+		default:
+			LOG_FUNC_RETURN(ctx, SC_ERROR_NOT_SUPPORTED);
+	}
+
+	/* card allow us to send multiple of "block size" in one APDU, (CBC mode) */
+	if (cbc)
+		max_apdu_datalen -= max_apdu_datalen % block_size;
+	else
+		max_apdu_datalen = block_size;
+
+
+	/* main loop */
+        while (padded_data_len > 0) {
+		if (dir)
+			sc_format_apdu(card, &apdu, SC_APDU_CASE_4_SHORT, 0x2A, 0x84, 0x80);
+		else
+			sc_format_apdu(card, &apdu, SC_APDU_CASE_4_SHORT, 0x2A, 0x80, 0x84);
+		apdu.cla = 0;
+
+		/* calculate how many bytes can we put into this APDU */
+		if (padded_data_len > max_apdu_datalen) {
+			apdu_datalen = max_apdu_datalen;
+			/* if data can not be fitted into one APDU, and CBC is allowed, set chain bit */
+			if (cbc)
+				apdu.cla = 0x10;
+		}
+		else {
+			apdu_datalen = padded_data_len;
+		}
+
+		apdu.le = apdu_datalen;
+		apdu.lc = apdu_datalen;
+		apdu.datalen = apdu_datalen;
+		apdu.data = sbuf;
+		apdu.resplen = sizeof(rbuf);
+		apdu.resp = rbuf;
+
+		/* fix last block */
+		if (padded_data_len <= apdu_datalen) {
+			/* PKCS#7 padding, encipher operation */
+			if (padding && dir == 1) {
+				uint8_t pad_byte = apdu_datalen - datalen;
+
+				sc_log(ctx, "PKCS#7 padding byte: %d", pad_byte);
+				memset (sbuf, pad_byte, apdu_datalen);
+				/* last block - reduce padded data size to datalen */
+				padded_data_len = datalen;
+			}
+			/* card is responsible to report error for wrong Lc */
+			apdu_datalen = datalen;
+		}
+
+		memcpy (sbuf, data, apdu_datalen);
+		data += apdu_datalen;
+		padded_data_len -= apdu_datalen;
+		datalen -= apdu_datalen;
+
+		r = sc_transmit_apdu(card, &apdu);
+		LOG_TEST_RET(ctx, r, "APDU transmit failed");
+		r = sc_check_sw(card, apdu.sw1, apdu.sw2);
+		LOG_TEST_RET(ctx, r, "decrypt_sym/encrypt_sym failed");
+
+		if (apdu.resplen != apdu.datalen)
+			LOG_FUNC_RETURN(ctx, SC_ERROR_WRONG_LENGTH);
+
+		if ((return_len + apdu.resplen) > outlen)
+			LOG_FUNC_RETURN(ctx, SC_ERROR_BUFFER_TOO_SMALL);
+
+		memcpy(out, apdu.resp, apdu.resplen);
+		out += apdu.resplen;
+		return_len += apdu.resplen;
+	}
+
+	/* remove PKCS#7 padding if requested.. */
+	if (dir == 0 && padding && return_len)  {
+		uint8_t i, pad_byte = *(out - 1);
+
+		sc_log(ctx, "Padding byte = %d", pad_byte);
+		if (pad_byte == 0 || pad_byte > block_size || pad_byte > return_len)
+			LOG_FUNC_RETURN(ctx, SC_ERROR_WRONG_PADDING);
+		out -= pad_byte;
+		for (i=0; i < pad_byte; i++)
+			if (out[i] != pad_byte)
+				LOG_FUNC_RETURN(ctx, SC_ERROR_WRONG_PADDING);
+		return_len -= pad_byte;
+	}
+	LOG_FUNC_RETURN(ctx, return_len);
+}
+
+static int myeid_encrypt_sym(struct sc_card *card, const u8 * data, size_t datalen,
+                        u8 * out, size_t outlen, unsigned int algorithm, unsigned int algorithm_flags, unsigned char key_ref[8])
+{
+	return myeid_enc_dec_sym (card, data, datalen, out, outlen, algorithm, algorithm_flags, 1);
+}
+
+
+static int myeid_decrypt_sym(struct sc_card *card, const u8 * data, size_t datalen,
+                        u8 * out, size_t outlen, unsigned int algorithm, unsigned int algorithm_flags, unsigned char key_ref[8])
+{
+	return myeid_enc_dec_sym (card, data, datalen, out, outlen, algorithm, algorithm_flags, 0);
+}
 
 static struct sc_card_driver * sc_get_driver(void)
 {
@@ -1829,6 +2037,8 @@ static struct sc_card_driver * sc_get_driver(void)
 	myeid_ops.pin_cmd		= myeid_pin_cmd;
 	myeid_ops.wrap			= myeid_wrap_key;
 	myeid_ops.unwrap		= myeid_unwrap_key;
+	myeid_ops.encrypt_sym		= myeid_encrypt_sym;
+	myeid_ops.decrypt_sym		= myeid_decrypt_sym;
 	return &myeid_drv;
 }
 
